@@ -14,7 +14,6 @@ function splitName(full) {
     .replace(/,?\s*Broker\s*Associate/i, '')
     .replace(/\b(Realtor\u00AE?|Broker\s*Associate|Team|Group)\b/gi, '')
     .trim();
-
   if (!name) return { firstName: '', lastName: '' };
   const parts = name.split(' ');
   if (parts.length === 1) return { firstName: parts[0], lastName: '' };
@@ -83,27 +82,23 @@ async function autoScroll(page, maxSteps = 30) {
 
 // Try to discover the "next" page URL via common patterns
 async function getNextHref(page) {
-  // rel=next
   const rel = await page.locator('a[rel="next"]').first();
   if (await rel.count()) {
     const href = await rel.getAttribute('href');
     if (href) return new URL(href, page.url()).href;
   }
-  // aria-label next
   const ariaNext = await page.evaluate(() => {
     const cand = Array.from(document.querySelectorAll('a[aria-label]'))
       .find(a => /next/i.test(a.getAttribute('aria-label') || ''));
     return cand ? (cand.getAttribute('href') || '') : '';
   });
   if (ariaNext) return new URL(ariaNext, page.url()).href;
-  // text next
   const textNext = await page.evaluate(() => {
     const cand = Array.from(document.querySelectorAll('a'))
       .find(a => /\bnext\b/i.test(a.textContent || ''));
     return cand ? (cand.getAttribute('href') || '') : '';
   });
   if (textNext) return new URL(textNext, page.url()).href;
-  // page= param
   const paramNext = await page.evaluate(() => {
     const links = Array.from(document.querySelectorAll('a[href*="page="]'));
     const tuples = links.map(a => {
@@ -140,12 +135,55 @@ async function dismissBanners(page) {
   } catch {}
 }
 
+// Harvest agent links from anchors, JSON-LD, and raw HTML
+async function harvestAgentLinks(page) {
+  // 1) Direct anchors
+  let hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.getAttribute('href') || '').filter(Boolean));
+  hrefs = hrefs.map(u => {
+    try { return new URL(u, document.baseURI).href; } catch { return ''; }
+  }).filter(Boolean);
+
+  // 2) JSON-LD blocks
+  const ld = await page.$$eval('script[type="application/ld+json"]', (els) => els.map(el => el.textContent || ''));
+  for (const block of ld) {
+    try {
+      const data = JSON.parse(block);
+      const arr = Array.isArray(data) ? data : [data];
+      for (const obj of arr) {
+        const url = obj && obj.url;
+        if (typeof url === 'string') hrefs.push(new URL(url, document.baseURI).href);
+        if (obj && obj.itemListElement && Array.isArray(obj.itemListElement)) {
+          for (const it of obj.itemListElement) {
+            const u = it && (it.url || (it.item && it.item.url));
+            if (typeof u === 'string') hrefs.push(new URL(u, document.baseURI).href);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 3) Raw HTML regex (/agents/.../aid-...)
+  const html = await page.content();
+  const re = /https?:\/\/[^"']*\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi;
+  const abs = html.match(re) || [];
+  hrefs.push(...abs);
+
+  // Normalize unique and filter to agent-like
+  const uniq = Array.from(new Set(hrefs)).filter(u =>
+    /\/fl\/jacksonville\/agents\//i.test(u) || /\/agents\//i.test(u)
+  );
+  return uniq;
+}
+
 Actor.main(async () => {
   const input = (await Actor.getInput()) || {};
   const {
     startUrls = [
       { url: 'https://www.coldwellbanker.com/city/fl/jacksonville/agents' },
-      { url: 'https://www.coldwellbanker.com/fl/jacksonville/agents' }
+      { url: 'https://www.coldwellbanker.com/fl/jacksonville/agents' },
+      // fallbacks: known office directories that often list agents
+      { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUTiIbfCywM8' },
+      { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2' }
     ],
     maxPages = 200,
     maxConcurrency = 5,
@@ -163,7 +201,7 @@ Actor.main(async () => {
     requestQueue,
     maxConcurrency,
     headless: true,
-    requestHandlerTimeoutSecs: 150,
+    requestHandlerTimeoutSecs: 180,
     navigationTimeoutSecs: 75,
     proxyConfiguration: proxy ? await Actor.createProxyConfiguration(proxy) : undefined,
     launchContext: {
@@ -172,54 +210,45 @@ Actor.main(async () => {
       }
     },
 
-    async requestHandler({ request, page, enqueueLinks }) {
+    async requestHandler({ request, page }) {
       const { label } = request.userData || {};
 
       if (label === 'LIST') {
         await page.waitForLoadState('domcontentloaded');
         await dismissBanners(page);
-        await page.waitForTimeout(1500);
-        await autoScroll(page, 25);
+        await page.waitForTimeout(2000);
+        await autoScroll(page, 30);
 
-        // Try "Load more" buttons if present
-        const loadMore = page.locator('button:has-text("Load More"), button[aria-label*="Load more"]').first();
-        let clicks = 0;
-        while (await loadMore.count() && clicks < 5) {
-          await loadMore.click().catch(()=>{});
-          clicks += 1;
-          await page.waitForTimeout(1200);
-          await autoScroll(page, 10);
+        // Try to unfold content
+        const loadMore = page.locator('button:has-text("Load More"), button[aria-label*="Load more"], button:has-text("Show More")').first();
+        for (let i = 0; i < 6; i++) {
+          if (await loadMore.count()) {
+            await loadMore.click().catch(()=>{});
+            await page.waitForTimeout(1200);
+          } else break;
         }
 
-        // Wait for any anchor with /agents/ to appear
-        await page.waitForSelector('a[href*="/agents/"]', { timeout: 8000 }).catch(()=>{});
-
-        // Collect agent profile links broadly; exclude offices
-        let hrefs = await page.$$eval('a[href*="/agents/"]', (as) => {
-          const urls = as.map(a => a.getAttribute('href') || '').filter(Boolean);
-          return urls
-            .filter(u => !/\/offices\//.test(u))
-            .map(u => new URL(u, document.baseURI).href);
-        });
-
-        // Unique
-        hrefs = Array.from(new Set(hrefs));
+        const links = await harvestAgentLinks(page);
 
         // Enqueue agent profiles
-        for (const url of hrefs) {
-          await requestQueue.addRequest({ url, userData: { label: 'AGENT' }, uniqueKey: url.split('?')[0] });
+        let enqueued = 0;
+        for (const url of links) {
+          if (/\/agents\//i.test(url) && !/\/offices\//i.test(url)) {
+            await requestQueue.addRequest({ url, userData: { label: 'AGENT' }, uniqueKey: url.split('?')[0] });
+            enqueued++;
+          }
         }
-        log.info(`LIST found ${hrefs.length} agent links on ${page.url()}`);
+        log.info(`LIST found ${enqueued} candidate agent links on ${page.url()}`);
 
-        // Pagination detection
+        // Next page
         const nextHref = await getNextHref(page);
         const nextPageNo = (request.userData.pageNo || 1) + 1;
         if (nextHref && nextPageNo <= maxPages) {
           await requestQueue.addRequest({ url: nextHref, userData: { label: 'LIST', pageNo: nextPageNo }, uniqueKey: nextHref.split('?')[0] });
         }
 
-        // Debug dump if nothing found on first page
-        if ((request.userData.pageNo || 1) === 1 && hrefs.length === 0) {
+        // Debug artifacts
+        if ((request.userData.pageNo || 1) === 1 && enqueued === 0) {
           const buf = await page.screenshot({ fullPage: true });
           await Actor.setValue('list_page_debug.png', buf, { contentType: 'image/png' });
           const html = await page.content();

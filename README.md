@@ -1,21 +1,23 @@
 # Coldwell Banker Jacksonville Agents → Brevo CSV (Apify Actor)
 
-**Further hardening to fix 'no records':**
-- Dismisses cookie / consent banners (OneTrust-like).
-- Auto-scroll + optional **Load More** clicks.
-- Waits for `a[href*="/agents/"]` then collects all **/agents/** links (excludes offices).
-- Stronger pagination detection (rel/aria/text/param).
-- Dumps **list_page_debug.png** and **list_page_debug.html** if zero links on first page.
+**Ultimate hardening for zero-results cases:**
+- Dismisses cookie/consent banners.
+- Auto-scroll + optional "Load More" clicks.
+- Harvests agent links from **anchors**, **JSON-LD**, and **raw HTML regex** (`/agents/.../aid-...`).
+- Adds fallback **office-directory pages** as seeds.
+- Saves **list_page_debug.png** and **list_page_debug.html** if still no links after first page.
 
-## Local run
+## Run locally
 npm install
 npm start
 
-## Apify example input
+## Apify input (example)
 {
   "startUrls": [
     {"url": "https://www.coldwellbanker.com/city/fl/jacksonville/agents"},
-    {"url": "https://www.coldwellbanker.com/fl/jacksonville/agents"}
+    {"url": "https://www.coldwellbanker.com/fl/jacksonville/agents"},
+    {"url": "https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUTiIbfCywM8"},
+    {"url": "https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2"}
   ],
   "maxPages": 200,
   "maxConcurrency": 5,

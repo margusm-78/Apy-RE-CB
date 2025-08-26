@@ -1,18 +1,23 @@
 # Coldwell Banker Jacksonville Agents → Brevo CSV (Apify Actor)
 
-**Fix for 'cannot find any data':** This version targets the city-page URL and uses robust link discovery on the list page, including auto-scroll and broad href filtering (`/agents/` + `/aid-`). It also saves a screenshot (`list_page_debug.png`) if zero agent links are found on the first page.
+**Fixes applied:**
+- Removed invalid CSS selector causing pagination error.
+- Robust agent link capture (`/agents/` with `/aid-` or `/agent/` in href).
+- Handles both list URL variants: `/city/fl/jacksonville/agents` and `/fl/jacksonville/agents`.
+- Auto-scroll + multiple "Next" detection strategies.
+- Saves `list_page_debug.png` if no agent links found on first list page.
 
-Run → Download `brevo.csv` from Key-Value store.
-
-## Defaults
-- startUrls: https://www.coldwellbanker.com/city/fl/jacksonville/agents
-- Extractors use:
-  - Name: `h1[data-testid="office-name"]`
-  - Email: `div[data-testid="emailDiv"] a[data-testid="emailLink"]` (mailto)
-  - Phone: `a[href^="tel:"]` → fallback to `p.MuiTypography-body1.css-1p1owym` → regex
-
-## Local
-```bash
+## Run locally
 npm install
 npm start
-```
+
+## Apify input (example)
+{
+  "startUrls": [
+    {"url": "https://www.coldwellbanker.com/city/fl/jacksonville/agents"},
+    {"url": "https://www.coldwellbanker.com/fl/jacksonville/agents"}
+  ],
+  "maxPages": 200,
+  "maxConcurrency": 5,
+  "proxy": { "useApifyProxy": true }
+}

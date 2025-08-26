@@ -1,5 +1,5 @@
 {
-  "title": "Coldwell Banker Jacksonville Agents Scraper (Optimized v2)",
+  "title": "Coldwell Banker Jacksonville Agents Scraper (Optimized v3)",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -14,34 +14,35 @@
         },
         {
           "url": "https://www.coldwellbanker.com/fl/jacksonville/agents"
-        },
-        {
-          "url": "https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUTiIbfCywM8"
-        },
-        {
-          "url": "https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2"
         }
       ]
     },
+    "listPageCount": {
+      "title": "City list pages to scan (fallback)",
+      "type": "integer",
+      "minimum": 1,
+      "default": 25,
+      "description": "If we can't detect the last page from the DOM, we'll enqueue pages 2..N using this number (e.g., 25)."
+    },
     "maxPages": {
-      "title": "Max list pages to crawl",
+      "title": "Max list pages (upper bound)",
       "type": "integer",
       "minimum": 1,
       "default": 60,
-      "description": "Upper limit for paginated list pages to enqueue."
+      "description": "Safety cap. Numeric pagination won't enqueue beyond this."
     },
     "maxConcurrency": {
       "title": "Max concurrency",
       "type": "integer",
       "minimum": 1,
       "default": 4,
-      "description": "How many pages to crawl in parallel. Keep modest on small containers."
+      "description": "Keep modest on small containers."
     },
     "maxAgents": {
       "title": "Stop after N agents",
       "type": "integer",
       "minimum": 1,
-      "default": 120,
+      "default": 200,
       "description": "Soft cap to avoid run timeouts. Increase if you raise the run timeout."
     },
     "blockResources": {

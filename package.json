@@ -1,7 +1,7 @@
 {
-  "name": "coldwellbanker-jax-agents-apify-actor-optimized-v2",
-  "version": "1.2.0",
-  "description": "Optimized Apify actor for Coldwell Banker Jacksonville agents \u2192 Brevo CSV (v2)",
+  "name": "coldwellbanker-jax-agents-apify-actor-optimized-v3",
+  "version": "1.3.0",
+  "description": "Optimized Apify actor for Coldwell Banker Jacksonville agents \u2192 Brevo CSV (v3 with numeric pagination)",
   "type": "module",
   "scripts": {
     "start": "node src/main.js",

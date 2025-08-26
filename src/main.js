@@ -3,7 +3,6 @@ import { PlaywrightCrawler, log } from 'crawlee';
 
 // ==== helpers ====
 const CLEAN = (t) => (t || '').replace(/\s+/g, ' ').trim();
-const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 function splitName(full) {
   const name = CLEAN(full)
@@ -65,7 +64,7 @@ async function extractEmail(page) {
   return m ? m[0].toLowerCase() : '';
 }
 
-// Minimal auto-scroll only when needed
+// Minimal auto-scroll (only if needed)
 async function autoScroll(page, steps = 5, pause = 250) {
   let last = await page.evaluate(() => document.body.scrollHeight);
   for (let i = 0; i < steps; i++) {
@@ -77,33 +76,29 @@ async function autoScroll(page, steps = 5, pause = 250) {
   }
 }
 
-// Fast link harvesting
+// Harvest agent links – anchors first; fallback to attributes/JSON-LD/regex
 async function harvestAgentLinks(page, cap = 400) {
   const base = page.url();
   const out = new Set();
 
-  // 1) Anchors first (fast path)
-  const anchors = await page.$$eval('a[href*="/agents/"]', as => as.map(a => a.getAttribute('href') || ''));
-  for (const u of anchors) {
-    try {
-      const abs = new URL(u, base).href;
-      if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
-    } catch {}
-  }
+  const collectAnchors = async () => {
+    const anchors = await page.$$eval('a[href*="/agents/"]', as => as.map(a => a.getAttribute('href') || ''));
+    for (const u of anchors) {
+      try {
+        const abs = new URL(u, base).href;
+        if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
+      } catch {}
+    }
+  };
+
+  await collectAnchors();
   if (out.size) return Array.from(out).slice(0, cap);
 
-  // 2) Short scroll & retry
   await autoScroll(page, 5, 200);
-  const anchors2 = await page.$$eval('a[href*="/agents/"]', as => as.map(a => a.getAttribute('href') || ''));
-  for (const u of anchors2) {
-    try {
-      const abs = new URL(u, base).href;
-      if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
-    } catch {}
-  }
+  await collectAnchors();
   if (out.size) return Array.from(out).slice(0, cap);
 
-  // 3) data-* / React
+  // data-* / React
   const attrSelectors = ['[data-href]', '[data-url]', '[to]'].join(', ');
   const attrs = await page.$$eval(attrSelectors, els => {
     const r = [];
@@ -120,7 +115,7 @@ async function harvestAgentLinks(page, cap = 400) {
     } catch {}
   }
 
-  // 4) JSON-LD urls
+  // JSON-LD urls
   const ld = await page.$$eval('script[type="application/ld+json"]', els => els.map(el => el.textContent || ''));
   for (const block of ld) {
     try {
@@ -145,7 +140,7 @@ async function harvestAgentLinks(page, cap = 400) {
     } catch {}
   }
 
-  // 5) Regex absolute + relative
+  // Regex absolute + relative
   const html = await page.content();
   const abs = html.match(/https?:\/\/[^"'>\s]*\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
   const rel = html.match(/\/(?:[a-z]{2})\/[a-z0-9-]+\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
@@ -190,20 +185,22 @@ async function getNextHref(page) {
   return '';
 }
 
+// Module-scope state to seed numeric pagination only once
+const GLOBAL_STATE = { numericSeeded: false };
+
 Actor.main(async () => {
   const input = (await Actor.getInput()) || {};
   const defaults = [
     { url: 'https://www.coldwellbanker.com/city/fl/jacksonville/agents' },
     { url: 'https://www.coldwellbanker.com/fl/jacksonville/agents' },
-    { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUTiIbfCywM8' },
-    { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2' },
   ];
   const startUrls = Array.isArray(input.startUrls) && input.startUrls.length ? [...input.startUrls, ...defaults] : defaults;
 
   const {
+    listPageCount = 25,
     maxPages = 60,
     maxConcurrency = 4,
-    maxAgents = 120,
+    maxAgents = 200,
     blockResources = true,
     followContact = true,
     proxy,
@@ -252,7 +249,42 @@ Actor.main(async () => {
       if (label === 'LIST') {
         await dismissBanners(page);
 
-        const links = await harvestAgentLinks(page, 400);
+        // Seed numeric pagination ONCE across run for city pages
+        if (!GLOBAL_STATE.numericSeeded) {
+          const url = new URL(page.url());
+          const isCityList = /\/city\/[^/]+\/[^/]+\/agents/i.test(url.pathname);
+          if (isCityList) {
+            // read highest 'page=' present
+            const maxFound = await page.$$eval('a[href*="page="]', (as) => {
+              const nums = as.map(a => {
+                try {
+                  const u = new URL(a.getAttribute('href') || '', document.baseURI);
+                  const n = parseInt(u.searchParams.get('page') || '0', 10);
+                  return isNaN(n) ? 0 : n;
+                } catch { return 0; }
+              }).filter(n => n > 0);
+              return nums.length ? Math.max(...nums) : 0;
+            }).catch(()=>0);
+            const targetLast = Math.min(maxFound || listPageCount, maxPages);
+
+            // Base as page=1
+            url.searchParams.set('page', '1');
+            const base = url.href;
+
+            let enq = 0;
+            for (let p = 2; p <= targetLast; p++) {
+              const u = new URL(base);
+              u.searchParams.set('page', String(p));
+              await requestQueue.addRequest({ url: u.href, userData: { label: 'LIST', pageNo: p }, uniqueKey: u.href });
+              enq++;
+            }
+            log.info(`Numeric pagination seeded ${enq} pages (2..${targetLast}) for ${base}`);
+            GLOBAL_STATE.numericSeeded = true;
+          }
+        }
+
+        // Harvest profile links
+        const links = await harvestAgentLinks(page, 500);
         let enqueued = 0;
         for (const url of links) {
           if (state.pushed >= maxAgents) { state.stop = true; break; }
@@ -261,6 +293,7 @@ Actor.main(async () => {
         }
         log.info(`LIST found ${enqueued} agent links on ${page.url()}`);
 
+        // Fallback "next" discovery if we still need more
         if (!state.stop) {
           const nextHref = await getNextHref(page);
           const nextPageNo = (request.userData.pageNo || 1) + 1;

@@ -1,7 +1,7 @@
 {
-  "name": "coldwellbanker-jax-agents-apify-actor",
-  "version": "1.0.0",
-  "description": "Apify actor to scrape Coldwell Banker Jacksonville agents (name, phone, email) and export Brevo-ready CSV",
+  "name": "coldwellbanker-jax-agents-apify-actor-optimized-v2",
+  "version": "1.2.0",
+  "description": "Optimized Apify actor for Coldwell Banker Jacksonville agents \u2192 Brevo CSV (v2)",
   "type": "module",
   "scripts": {
     "start": "node src/main.js",

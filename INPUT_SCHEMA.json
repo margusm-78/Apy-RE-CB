@@ -1,5 +1,5 @@
 {
-  "title": "Coldwell Banker Jacksonville Agents Scraper",
+  "title": "Coldwell Banker Jacksonville Agents Scraper (Optimized v2)",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -7,7 +7,7 @@
       "title": "Start URLs",
       "type": "array",
       "editor": "requestListSources",
-      "description": "Agent list pages to start from. Defaults to the Jacksonville agents index.",
+      "description": "Agent city pages or office pages to start from.",
       "prefill": [
         {
           "url": "https://www.coldwellbanker.com/city/fl/jacksonville/agents"
@@ -27,21 +27,40 @@
       "title": "Max list pages to crawl",
       "type": "integer",
       "minimum": 1,
-      "default": 200,
-      "description": "Upper limit for paginated list pages to enqueue (prevents infinite loops)."
+      "default": 60,
+      "description": "Upper limit for paginated list pages to enqueue."
     },
     "maxConcurrency": {
       "title": "Max concurrency",
       "type": "integer",
       "minimum": 1,
-      "default": 5,
-      "description": "How many pages to crawl in parallel. Increase carefully to avoid throttling/blocks."
+      "default": 4,
+      "description": "How many pages to crawl in parallel. Keep modest on small containers."
+    },
+    "maxAgents": {
+      "title": "Stop after N agents",
+      "type": "integer",
+      "minimum": 1,
+      "default": 120,
+      "description": "Soft cap to avoid run timeouts. Increase if you raise the run timeout."
+    },
+    "blockResources": {
+      "title": "Block heavy resources",
+      "type": "boolean",
+      "default": true,
+      "description": "Block images, fonts, media, stylesheets and common analytics domains to speed up crawling."
+    },
+    "followContact": {
+      "title": "Follow Contact page if email missing",
+      "type": "boolean",
+      "default": true,
+      "description": "If true, enqueue the agent's Contact page when email is not found on profile."
     },
     "proxy": {
       "title": "Proxy configuration",
       "type": "object",
       "editor": "proxy",
-      "description": "Use Apify Proxy or your own proxy for reliability and to reduce blocking."
+      "description": "Use Apify Proxy or your own proxy."
     }
   },
   "required": [

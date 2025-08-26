@@ -1,8 +1,7 @@
 {
-  "name": "Coldwell Banker Jax Agents",
-  "title": "Coldwell Banker Jacksonville Agents to Brevo CSV",
-  "description": "Extracts agent name, phone, and email (from each agent's Contact page) and outputs a Brevo-ready CSV (EMAIL, FIRSTNAME, LASTNAME, SMS).",
-  "version": "1.0",
-  "buildTag": "latest",
-  "env": null
+  "name": "coldwellbanker-jax-agents-apify-actor-optimized-v2",
+  "title": "Coldwell Banker Jacksonville Agents \u2192 Brevo CSV (Optimized v2)",
+  "description": "Extract Jacksonville agent name, phone, and email from profile/contact pages and export a Brevo CSV. Lighter + faster.",
+  "version": "1.2.0",
+  "buildTag": "latest"
 }

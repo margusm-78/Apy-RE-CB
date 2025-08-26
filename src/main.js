@@ -1,15 +1,12 @@
 import { Actor } from 'apify';
 import { PlaywrightCrawler, log } from 'crawlee';
 
-// --- helpers ---
+// ==== helpers ====
+const CLEAN = (t) => (t || '').replace(/\s+/g, ' ').trim();
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-function cleanText(t) {
-  return (t || '').replace(/\s+/g, ' ').trim();
-}
-
 function splitName(full) {
-  const name = cleanText(full)
+  const name = CLEAN(full)
     .replace(/,?\s*Realtor\u00AE?/i, '')
     .replace(/,?\s*Broker\s*Associate/i, '')
     .replace(/\b(Realtor\u00AE?|Broker\s*Associate|Team|Group)\b/gi, '')
@@ -34,33 +31,33 @@ function toE164(usLike) {
 
 async function extractName(page) {
   const el = page.locator('h1[data-testid="office-name"]').first();
-  if (await el.count()) return cleanText(await el.textContent());
-  return cleanText(await page.locator('h1, h2').first().textContent());
+  if (await el.count()) return CLEAN(await el.textContent());
+  return CLEAN(await page.locator('h1, h2').first().textContent().catch(()=>'') || '');
 }
 
 async function extractPhone(page) {
-  const specific = page.locator('p.MuiTypography-body1.css-1p1owym').first();
-  if (await specific.count()) return cleanText(await specific.textContent());
-  const telLink = page.locator('a[href^="tel:"]').first();
-  if (await telLink.count()) {
-    const href = await telLink.getAttribute('href');
-    if (href) return cleanText(href.replace(/^tel:/i, ''));
+  const p = page.locator('p.MuiTypography-body1.css-1p1owym').first();
+  if (await p.count()) return CLEAN(await p.textContent());
+  const tel = page.locator('a[href^="tel:"]').first();
+  if (await tel.count()) {
+    const href = await tel.getAttribute('href');
+    if (href) return CLEAN(href.replace(/^tel:/i, ''));
   }
-  const texts = await page.$$eval('*', (els) => els.map((el) => el.textContent || ''));
-  const joined = texts.join(' ');
-  const m = joined.match(/\(?(?:\d{3})\)?[\s.-]?(?:\d{3})[\s.-]?(?:\d{4})/);
+  const text = await page.textContent('body').catch(()=>'') || '';
+  const m = text.match(/\(?(?:\d{3})\)?[\s.-]?(?:\d{3})[\s.-]?(?:\d{4})/);
   return m ? m[0] : '';
 }
 
 async function extractEmail(page) {
-  const emailA = page.locator('div[data-testid="emailDiv"] a[data-testid="emailLink"]').first();
-  if (await emailA.count()) {
-    const href = await emailA.getAttribute('href');
+  const sel = 'div[data-testid="emailDiv"] a[data-testid="emailLink"]';
+  const a = page.locator(sel).first();
+  if (await a.count()) {
+    const href = await a.getAttribute('href');
     if (href && /^mailto:/i.test(href)) return href.replace(/^mailto:/i, '').trim().toLowerCase();
   }
-  const anyMailto = page.locator('a[href^="mailto:"]').first();
-  if (await anyMailto.count()) {
-    const href = await anyMailto.getAttribute('href');
+  const any = page.locator('a[href^="mailto:"]').first();
+  if (await any.count()) {
+    const href = await any.getAttribute('href');
     if (href) return href.replace(/^mailto:/i, '').trim().toLowerCase();
   }
   const html = await page.content();
@@ -68,55 +65,101 @@ async function extractEmail(page) {
   return m ? m[0].toLowerCase() : '';
 }
 
-// Auto-scroll for lazy-load content
-async function autoScroll(page, maxSteps = 30) {
-  let lastHeight = await page.evaluate(() => document.body.scrollHeight);
-  for (let i = 0; i < maxSteps; i++) {
+// Minimal auto-scroll only when needed
+async function autoScroll(page, steps = 5, pause = 250) {
+  let last = await page.evaluate(() => document.body.scrollHeight);
+  for (let i = 0; i < steps; i++) {
     await page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
-    await page.waitForTimeout(800);
-    const newHeight = await page.evaluate(() => document.body.scrollHeight);
-    if (newHeight === lastHeight) break;
-    lastHeight = newHeight;
+    await page.waitForTimeout(pause);
+    const next = await page.evaluate(() => document.body.scrollHeight);
+    if (next === last) break;
+    last = next;
   }
 }
 
-// Try to discover the "next" page URL via common patterns
-async function getNextHref(page) {
-  const rel = await page.locator('a[rel="next"]').first();
-  if (await rel.count()) {
-    const href = await rel.getAttribute('href');
-    if (href) return new URL(href, page.url()).href;
+// Fast link harvesting
+async function harvestAgentLinks(page, cap = 400) {
+  const base = page.url();
+  const out = new Set();
+
+  // 1) Anchors first (fast path)
+  const anchors = await page.$$eval('a[href*="/agents/"]', as => as.map(a => a.getAttribute('href') || ''));
+  for (const u of anchors) {
+    try {
+      const abs = new URL(u, base).href;
+      if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
+    } catch {}
   }
-  const ariaNext = await page.evaluate(() => {
-    const cand = Array.from(document.querySelectorAll('a[aria-label]'))
-      .find(a => /next/i.test(a.getAttribute('aria-label') || ''));
-    return cand ? (cand.getAttribute('href') || '') : '';
-  });
-  if (ariaNext) return new URL(ariaNext, page.url()).href;
-  const textNext = await page.evaluate(() => {
-    const cand = Array.from(document.querySelectorAll('a'))
-      .find(a => /\bnext\b/i.test(a.textContent || ''));
-    return cand ? (cand.getAttribute('href') || '') : '';
-  });
-  if (textNext) return new URL(textNext, page.url()).href;
-  const paramNext = await page.evaluate(() => {
-    const links = Array.from(document.querySelectorAll('a[href*="page="]'));
-    const tuples = links.map(a => {
-      try {
-        const u = new URL(a.getAttribute('href'), document.baseURI);
-        const p = +(u.searchParams.get('page') || '0');
-        return { href: u.href, p };
-      } catch { return { href: '', p: 0 }; }
-    }).filter(t => t.p > 0);
-    if (!tuples.length) return '';
-    tuples.sort((a,b) => a.p - b.p);
-    return tuples[0].href;
-  });
-  if (paramNext) return paramNext;
-  return '';
+  if (out.size) return Array.from(out).slice(0, cap);
+
+  // 2) Short scroll & retry
+  await autoScroll(page, 5, 200);
+  const anchors2 = await page.$$eval('a[href*="/agents/"]', as => as.map(a => a.getAttribute('href') || ''));
+  for (const u of anchors2) {
+    try {
+      const abs = new URL(u, base).href;
+      if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
+    } catch {}
+  }
+  if (out.size) return Array.from(out).slice(0, cap);
+
+  // 3) data-* / React
+  const attrSelectors = ['[data-href]', '[data-url]', '[to]'].join(', ');
+  const attrs = await page.$$eval(attrSelectors, els => {
+    const r = [];
+    for (const el of els) {
+      const v = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('to') || '';
+      if (v) r.push(v);
+    }
+    return r;
+  }).catch(()=>[]);
+  for (const u of attrs) {
+    try {
+      const abs = new URL(u, base).href;
+      if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
+    } catch {}
+  }
+
+  // 4) JSON-LD urls
+  const ld = await page.$$eval('script[type="application/ld+json"]', els => els.map(el => el.textContent || ''));
+  for (const block of ld) {
+    try {
+      const data = JSON.parse(block);
+      const arr = Array.isArray(data) ? data : [data];
+      for (const obj of arr) {
+        const url = obj && obj.url;
+        if (typeof url === 'string') {
+          const abs = new URL(url, base).href;
+          if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
+        }
+        if (obj && obj.itemListElement && Array.isArray(obj.itemListElement)) {
+          for (const it of obj.itemListElement) {
+            const u = it && (it.url || (it.item && it.item.url));
+            if (typeof u === 'string') {
+              const abs = new URL(u, base).href;
+              if (/\/agents\//i.test(abs) && !/\/offices\//i.test(abs)) out.add(abs);
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 5) Regex absolute + relative
+  const html = await page.content();
+  const abs = html.match(/https?:\/\/[^"'>\s]*\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
+  const rel = html.match(/\/(?:[a-z]{2})\/[a-z0-9-]+\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
+  for (const u of [...abs, ...rel]) {
+    try {
+      const absu = new URL(u, base).href;
+      if (/\/agents\//i.test(absu) && !/\/offices\//i.test(absu)) out.add(absu);
+    } catch {}
+  }
+
+  return Array.from(out).slice(0, cap);
 }
 
-// Attempt to dismiss cookie / consent banners
+// Dismiss OneTrust-like cookie banner
 async function dismissBanners(page) {
   try {
     const sel = [
@@ -125,87 +168,48 @@ async function dismissBanners(page) {
       'button:has-text("Accept All")',
       'button:has-text("Accept")',
       'button[aria-label="Accept"]',
-      'button[aria-label*="Accept"]'
+      'button[aria-label*="Accept"]',
     ].join(', ');
     const btn = page.locator(sel).first();
-    if (await btn.count()) {
-      await btn.click({ timeout: 0 }).catch(()=>{});
-      await page.waitForTimeout(500);
-    }
+    if (await btn.count()) { await btn.click({ timeout: 0 }).catch(()=>{}); await page.waitForTimeout(200); }
   } catch {}
 }
 
-// Harvest agent links from multiple sources, including relative paths and data-* attributes
-async function harvestAgentLinks(page) {
-  const base = page.url();
-
-  // 1) Anchors with href
-  let hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.getAttribute('href') || '').filter(Boolean));
-
-  // 2) Elements with data-href / data-url / to attributes (React routers, buttons)
-  const attrSelectors = ['[data-href]', '[data-url]', '[to]'].join(', ');
-  const attrHrefs = await page.$$eval(attrSelectors, (els) => {
-    const out = [];
-    for (const el of els) {
-      const v = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('to') || '';
-      if (v) out.push(v);
-    }
-    return out;
-  }).catch(() => []);
-
-  hrefs.push(...attrHrefs);
-
-  // 3) JSON-LD urls
-  const ld = await page.$$eval('script[type="application/ld+json"]', (els) => els.map(el => el.textContent || ''));
-  for (const block of ld) {
-    try {
-      const data = JSON.parse(block);
-      const arr = Array.isArray(data) ? data : [data];
-      for (const obj of arr) {
-        const url = obj && obj.url;
-        if (typeof url === 'string') hrefs.push(url);
-        if (obj && obj.itemListElement && Array.isArray(obj.itemListElement)) {
-          for (const it of obj.itemListElement) {
-            const u = it && (it.url || (it.item && it.item.url));
-            if (typeof u === 'string') hrefs.push(u);
-          }
-        }
-      }
-    } catch {}
+// Find "Next" quickly
+async function getNextHref(page) {
+  const rel = await page.locator('a[rel="next"]').first();
+  if (await rel.count()) {
+    const href = await rel.getAttribute('href');
+    if (href) return new URL(href, page.url()).href;
   }
-
-  // 4) Raw HTML regex for ABSOLUTE and RELATIVE agent links
-  const html = await page.content();
-  const abs = html.match(/https?:\/\/[^"'>\s]*\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
-  const rel = html.match(/\/(?:fl|ga|sc|nc|al|tx|ca|nj|ny)\/[a-z0-9-]+\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
-  hrefs.push(...abs, ...rel);
-
-  // Normalize to absolute and unique; filter to /agents/ and exclude /offices/
-  const norm = Array.from(new Set(hrefs.map((u) => {
-    try { return new URL(u, base).href; } catch { return ''; }
-  }).filter(Boolean))).filter(u => /\/agents\//i.test(u) && !/\/offices\//i.test(u));
-
-  return norm;
+  const ariaNext = await page.evaluate(() => {
+    const cand = Array.from(document.querySelectorAll('a[aria-label]')).find(a => /next/i.test(a.getAttribute('aria-label') || ''));
+    return cand ? (cand.getAttribute('href') || '') : '';
+  });
+  if (ariaNext) return new URL(ariaNext, page.url()).href;
+  return '';
 }
 
 Actor.main(async () => {
   const input = (await Actor.getInput()) || {};
-  // Always include our fallbacks in addition to any provided startUrls
   const defaults = [
     { url: 'https://www.coldwellbanker.com/city/fl/jacksonville/agents' },
     { url: 'https://www.coldwellbanker.com/fl/jacksonville/agents' },
     { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUTiIbfCywM8' },
-    { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2' }
+    { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2' },
   ];
-  const startUrls = Array.isArray(input.startUrls) && input.startUrls.length
-    ? [...input.startUrls, ...defaults]
-    : defaults;
+  const startUrls = Array.isArray(input.startUrls) && input.startUrls.length ? [...input.startUrls, ...defaults] : defaults;
 
   const {
-    maxPages = 200,
-    maxConcurrency = 5,
+    maxPages = 60,
+    maxConcurrency = 4,
+    maxAgents = 120,
+    blockResources = true,
+    followContact = true,
     proxy,
   } = input;
+
+  const state = { pushed: 0, stop: false };
 
   const requestQueue = await Actor.openRequestQueue();
   for (const s of startUrls) {
@@ -218,70 +222,71 @@ Actor.main(async () => {
     requestQueue,
     maxConcurrency,
     headless: true,
-    requestHandlerTimeoutSecs: 180,
-    navigationTimeoutSecs: 75,
+    navigationTimeoutSecs: 30,
+    requestHandlerTimeoutSecs: 45,
     proxyConfiguration: proxy ? await Actor.createProxyConfiguration(proxy) : undefined,
     launchContext: {
-      launchOptions: {
-        args: ['--no-sandbox','--disable-dev-shm-usage'],
-      }
+      launchOptions: { args: ['--no-sandbox', '--disable-dev-shm-usage'] },
     },
+    preNavigationHooks: [
+      async ({ page }, gotoOptions) => {
+        if (blockResources) {
+          await page.route('**/*', (route) => {
+            const req = route.request();
+            const type = req.resourceType();
+            const url = req.url();
+            if (['image','font','media','stylesheet'].includes(type)) return route.abort();
+            if (/googletagmanager|google-analytics|doubleclick|facebook|hotjar|optimizely|segment|intercom|zendesk|fullstory|youtube|vimeo/i.test(url))
+              return route.abort();
+            return route.continue();
+          });
+        }
+        gotoOptions.waitUntil = 'domcontentloaded';
+      },
+    ],
 
     async requestHandler({ request, page }) {
       const { label } = request.userData || {};
+      if (state.stop && label === 'LIST') return;
 
       if (label === 'LIST') {
-        await page.waitForLoadState('domcontentloaded');
         await dismissBanners(page);
-        await page.waitForTimeout(2000);
-        await autoScroll(page, 30);
 
-        // Optional "Load more"
-        const loadMore = page.locator('button:has-text("Load More"), button[aria-label*="Load more"], button:has-text("Show More")').first();
-        for (let i = 0; i < 6; i++) {
-          if (await loadMore.count()) {
-            await loadMore.click().catch(()=>{});
-            await page.waitForTimeout(1200);
-          } else break;
-        }
-
-        const links = await harvestAgentLinks(page);
+        const links = await harvestAgentLinks(page, 400);
         let enqueued = 0;
         for (const url of links) {
+          if (state.pushed >= maxAgents) { state.stop = true; break; }
           await requestQueue.addRequest({ url, userData: { label: 'AGENT' }, uniqueKey: url.split('?')[0] });
           enqueued++;
         }
-        log.info(`LIST found ${enqueued} candidate agent links on ${page.url()}`);
+        log.info(`LIST found ${enqueued} agent links on ${page.url()}`);
 
-        // Next page
-        const nextHref = await getNextHref(page);
-        const nextPageNo = (request.userData.pageNo || 1) + 1;
-        if (nextHref && nextPageNo <= maxPages) {
-          await requestQueue.addRequest({ url: nextHref, userData: { label: 'LIST', pageNo: nextPageNo }, uniqueKey: nextHref.split('?')[0] });
+        if (!state.stop) {
+          const nextHref = await getNextHref(page);
+          const nextPageNo = (request.userData.pageNo || 1) + 1;
+          if (nextHref && nextPageNo <= maxPages) {
+            await requestQueue.addRequest({ url: nextHref, userData: { label: 'LIST', pageNo: nextPageNo }, uniqueKey: nextHref.split('?')[0] });
+          }
         }
 
-        // Debug artifacts
         if ((request.userData.pageNo || 1) === 1 && enqueued === 0) {
           const buf = await page.screenshot({ fullPage: true });
           await Actor.setValue('list_page_debug.png', buf, { contentType: 'image/png' });
           const html = await page.content();
           await Actor.setValue('list_page_debug.html', html, { contentType: 'text/html; charset=utf-8' });
-          log.warning('No agent links found on LIST page. Saved list_page_debug.png and list_page_debug.html');
+          log.warning('No agent links found on LIST page. Saved list_page_debug artifacts.');
         }
       }
 
       if (label === 'AGENT') {
-        await page.waitForLoadState('domcontentloaded');
         await dismissBanners(page);
-        await page.waitForTimeout(800);
 
         const name = await extractName(page);
         const phoneRaw = await extractPhone(page);
         const phone = toE164(phoneRaw);
         let email = await extractEmail(page);
 
-        if (!email) {
-          // Try contact page
+        if (!email && followContact) {
           const contactHref = await page.evaluate(() => {
             const nodes = Array.from(document.querySelectorAll('a, button'));
             const link = nodes.find((el) => /contact/i.test(el.textContent || '') && el.tagName === 'A');
@@ -289,57 +294,33 @@ Actor.main(async () => {
             const btn = nodes.find((el) => /contact/i.test(el.textContent || '') && el.hasAttribute('data-href'));
             return btn ? btn.getAttribute('data-href') : '';
           });
-
           if (contactHref) {
             const url = new URL(contactHref, page.url()).href;
-            await requestQueue.addRequest({
-              url,
-              userData: { label: 'CONTACT', partial: { name, phone, profileUrl: page.url() } },
-              uniqueKey: url.split('?')[0],
-            });
-          } else if (email) {
-            const parts = splitName(name);
-            await Actor.pushData({
-              EMAIL: email,
-              FIRSTNAME: parts.firstName,
-              LASTNAME: parts.lastName,
-              SMS: phone,
-              sourceProfile: page.url(),
-              sourceContact: page.url(),
-            });
+            await requestQueue.addRequest({ url, userData: { label: 'CONTACT', partial: { name, phone, profileUrl: page.url() } }, uniqueKey: url.split('?')[0] });
+            return;
           }
-        } else {
-          const parts = splitName(name);
-          await Actor.pushData({
-            EMAIL: email,
-            FIRSTNAME: parts.firstName,
-            LASTNAME: parts.lastName,
-            SMS: phone,
-            sourceProfile: page.url(),
-            sourceContact: page.url(),
-          });
+        }
+
+        if (email) {
+          const { firstName, lastName } = splitName(name);
+          await Actor.pushData({ EMAIL: email, FIRSTNAME: firstName, LASTNAME: lastName, SMS: phone, sourceProfile: page.url(), sourceContact: page.url() });
+          state.pushed++;
+          if (state.pushed >= maxAgents) state.stop = true;
         }
       }
 
       if (label === 'CONTACT') {
-        await page.waitForLoadState('domcontentloaded');
         await dismissBanners(page);
-        await page.waitForTimeout(500);
 
         const email = await extractEmail(page);
         const phone = toE164(await extractPhone(page));
         const { name, profileUrl } = request.userData.partial || {};
-        const parts = splitName(name || '');
+        const { firstName, lastName } = splitName(name || '');
 
         if (email) {
-          await Actor.pushData({
-            EMAIL: email,
-            FIRSTNAME: parts.firstName,
-            LASTNAME: parts.lastName,
-            SMS: phone || '',
-            sourceProfile: profileUrl || '',
-            sourceContact: page.url(),
-          });
+          await Actor.pushData({ EMAIL: email, FIRSTNAME: firstName, LASTNAME: lastName, SMS: phone || '', sourceProfile: profileUrl || '', sourceContact: page.url() });
+          state.pushed++;
+          if (state.pushed >= maxAgents) state.stop = true;
         }
       }
     },
@@ -351,35 +332,30 @@ Actor.main(async () => {
 
   await crawler.run();
 
-  // Prepare Brevo CSV (manual writer)
+  // Build Brevo CSV
   const dataset = await Actor.openDataset();
   const { items } = await dataset.getData({ clean: true });
 
-  const deduped = [];
   const seen = new Set();
+  const deduped = [];
   for (const it of items) {
     const email = (it.EMAIL || '').toLowerCase();
     if (!email || seen.has(email)) continue;
     seen.add(email);
-    deduped.push({
-      EMAIL: email,
-      FIRSTNAME: it.FIRSTNAME || '',
-      LASTNAME: it.LASTNAME || '',
-      SMS: it.SMS || '',
-    });
+    deduped.push({ EMAIL: email, FIRSTNAME: it.FIRSTNAME || '', LASTNAME: it.LASTNAME || '', SMS: it.SMS || '' });
   }
 
-  const headers = ['EMAIL', 'FIRSTNAME', 'LASTNAME', 'SMS'];
-  const csvLines = [headers.join(',')];
+  const headers = ['EMAIL','FIRSTNAME','LASTNAME','SMS'];
+  const lines = [headers.join(',')];
   for (const row of deduped) {
-    const vals = headers.map((h) => {
-      const s = (row[h] ?? '').toString();
+    const esc = (v) => {
+      const s = (v ?? '').toString();
       return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-    });
-    csvLines.push(vals.join(','));
+    };
+    lines.push(headers.map(h => esc(row[h])).join(','));
   }
-  const csv = csvLines.join('\n');
-
+  const csv = lines.join('\n');
   await Actor.setValue('brevo.csv', csv, { contentType: 'text/csv; charset=utf-8' });
+
   log.info(`Done. Records: ${deduped.length}. CSV saved as brevo.csv in Key-Value store.`);
 });

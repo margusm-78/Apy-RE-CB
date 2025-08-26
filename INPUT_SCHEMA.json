@@ -1,0 +1,39 @@
+{
+  "title": "Coldwell Banker Jacksonville Agents Scraper",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrls": {
+      "title": "Start URLs",
+      "type": "array",
+      "editor": "requestListSources",
+      "description": "Pages that list agents. Defaults to Jacksonville agents index.",
+      "prefill": [
+        {
+          "url": "https://www.coldwellbanker.com/fl/jacksonville/agents"
+        }
+      ]
+    },
+    "maxPages": {
+      "title": "Max list pages to crawl",
+      "type": "integer",
+      "minimum": 1,
+      "default": 200
+    },
+    "maxConcurrency": {
+      "title": "Max concurrency",
+      "type": "integer",
+      "minimum": 1,
+      "default": 5
+    },
+    "proxy": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "editor": "proxy",
+      "description": "Use Apify proxy for reliability."
+    }
+  },
+  "required": [
+    "startUrls"
+  ]
+}

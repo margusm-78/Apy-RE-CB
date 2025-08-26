@@ -135,15 +135,27 @@ async function dismissBanners(page) {
   } catch {}
 }
 
-// Harvest agent links from anchors, JSON-LD, and raw HTML
+// Harvest agent links from multiple sources, including relative paths and data-* attributes
 async function harvestAgentLinks(page) {
-  // 1) Direct anchors
-  let hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.getAttribute('href') || '').filter(Boolean));
-  hrefs = hrefs.map(u => {
-    try { return new URL(u, document.baseURI).href; } catch { return ''; }
-  }).filter(Boolean);
+  const base = page.url();
 
-  // 2) JSON-LD blocks
+  // 1) Anchors with href
+  let hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.getAttribute('href') || '').filter(Boolean));
+
+  // 2) Elements with data-href / data-url / to attributes (React routers, buttons)
+  const attrSelectors = ['[data-href]', '[data-url]', '[to]'].join(', ');
+  const attrHrefs = await page.$$eval(attrSelectors, (els) => {
+    const out = [];
+    for (const el of els) {
+      const v = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('to') || '';
+      if (v) out.push(v);
+    }
+    return out;
+  }).catch(() => []);
+
+  hrefs.push(...attrHrefs);
+
+  // 3) JSON-LD urls
   const ld = await page.$$eval('script[type="application/ld+json"]', (els) => els.map(el => el.textContent || ''));
   for (const block of ld) {
     try {
@@ -151,40 +163,45 @@ async function harvestAgentLinks(page) {
       const arr = Array.isArray(data) ? data : [data];
       for (const obj of arr) {
         const url = obj && obj.url;
-        if (typeof url === 'string') hrefs.push(new URL(url, document.baseURI).href);
+        if (typeof url === 'string') hrefs.push(url);
         if (obj && obj.itemListElement && Array.isArray(obj.itemListElement)) {
           for (const it of obj.itemListElement) {
             const u = it && (it.url || (it.item && it.item.url));
-            if (typeof u === 'string') hrefs.push(new URL(u, document.baseURI).href);
+            if (typeof u === 'string') hrefs.push(u);
           }
         }
       }
     } catch {}
   }
 
-  // 3) Raw HTML regex (/agents/.../aid-...)
+  // 4) Raw HTML regex for ABSOLUTE and RELATIVE agent links
   const html = await page.content();
-  const re = /https?:\/\/[^"']*\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi;
-  const abs = html.match(re) || [];
-  hrefs.push(...abs);
+  const abs = html.match(/https?:\/\/[^"'>\s]*\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
+  const rel = html.match(/\/(?:fl|ga|sc|nc|al|tx|ca|nj|ny)\/[a-z0-9-]+\/agents\/[a-z0-9-]+\/aid-[A-Za-z0-9]+/gi) || [];
+  hrefs.push(...abs, ...rel);
 
-  // Normalize unique and filter to agent-like
-  const uniq = Array.from(new Set(hrefs)).filter(u =>
-    /\/fl\/jacksonville\/agents\//i.test(u) || /\/agents\//i.test(u)
-  );
-  return uniq;
+  // Normalize to absolute and unique; filter to /agents/ and exclude /offices/
+  const norm = Array.from(new Set(hrefs.map((u) => {
+    try { return new URL(u, base).href; } catch { return ''; }
+  }).filter(Boolean))).filter(u => /\/agents\//i.test(u) && !/\/offices\//i.test(u));
+
+  return norm;
 }
 
 Actor.main(async () => {
   const input = (await Actor.getInput()) || {};
+  // Always include our fallbacks in addition to any provided startUrls
+  const defaults = [
+    { url: 'https://www.coldwellbanker.com/city/fl/jacksonville/agents' },
+    { url: 'https://www.coldwellbanker.com/fl/jacksonville/agents' },
+    { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUTiIbfCywM8' },
+    { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2' }
+  ];
+  const startUrls = Array.isArray(input.startUrls) && input.startUrls.length
+    ? [...input.startUrls, ...defaults]
+    : defaults;
+
   const {
-    startUrls = [
-      { url: 'https://www.coldwellbanker.com/city/fl/jacksonville/agents' },
-      { url: 'https://www.coldwellbanker.com/fl/jacksonville/agents' },
-      // fallbacks: known office directories that often list agents
-      { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUTiIbfCywM8' },
-      { url: 'https://www.coldwellbanker.com/fl/jacksonville/offices/coldwell-banker-vanguard-realty/oid-P00400000FDdqREI4AhcDWyY6EmabUSzAkjhivJ2' }
-    ],
     maxPages = 200,
     maxConcurrency = 5,
     proxy,
@@ -219,7 +236,7 @@ Actor.main(async () => {
         await page.waitForTimeout(2000);
         await autoScroll(page, 30);
 
-        // Try to unfold content
+        // Optional "Load more"
         const loadMore = page.locator('button:has-text("Load More"), button[aria-label*="Load more"], button:has-text("Show More")').first();
         for (let i = 0; i < 6; i++) {
           if (await loadMore.count()) {
@@ -229,14 +246,10 @@ Actor.main(async () => {
         }
 
         const links = await harvestAgentLinks(page);
-
-        // Enqueue agent profiles
         let enqueued = 0;
         for (const url of links) {
-          if (/\/agents\//i.test(url) && !/\/offices\//i.test(url)) {
-            await requestQueue.addRequest({ url, userData: { label: 'AGENT' }, uniqueKey: url.split('?')[0] });
-            enqueued++;
-          }
+          await requestQueue.addRequest({ url, userData: { label: 'AGENT' }, uniqueKey: url.split('?')[0] });
+          enqueued++;
         }
         log.info(`LIST found ${enqueued} candidate agent links on ${page.url()}`);
 

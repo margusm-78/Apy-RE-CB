@@ -10,7 +10,7 @@
       "description": "Agent list pages to start from. Defaults to the Jacksonville agents index.",
       "prefill": [
         {
-          "url": "https://www.coldwellbanker.com/fl/jacksonville/agents"
+          "url": "https://www.coldwellbanker.com/city/fl/jacksonville/agents"
         }
       ]
     },

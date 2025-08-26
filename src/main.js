@@ -34,26 +34,19 @@ function toE164(usLike) {
 }
 
 async function extractName(page) {
-  // Preferred selector from user: h1[data-testid="office-name"]
   const el = page.locator('h1[data-testid="office-name"]').first();
   if (await el.count()) return cleanText(await el.textContent());
-  // Fallback: heading
   return cleanText(await page.locator('h1, h2').first().textContent());
 }
 
 async function extractPhone(page) {
-  // Preferred selector from user
   const p = page.locator('p.MuiTypography-body1.css-1p1owym').first();
   if (await p.count()) return cleanText(await p.textContent());
-
-  // tel: link
   const telLink = page.locator('a[href^="tel:"]').first();
   if (await telLink.count()) {
     const href = await telLink.getAttribute('href');
     if (href) return cleanText(href.replace(/^tel:/i, ''));
   }
-
-  // Fallback: regex scan over visible text
   const texts = await page.$$eval('*', (els) => els.map((el) => el.textContent || ''));
   const joined = texts.join(' ');
   const m = joined.match(/\(?(?:\d{3})\)?[\s.-]?(?:\d{3})[\s.-]?(?:\d{4})/);
@@ -61,32 +54,37 @@ async function extractPhone(page) {
 }
 
 async function extractEmail(page) {
-  // Preferred selector from user: div[emailDiv] a[emailLink] -> mailto
   const emailA = page.locator('div[data-testid="emailDiv"] a[data-testid="emailLink"]').first();
   if (await emailA.count()) {
     const href = await emailA.getAttribute('href');
-    if (href && /^mailto:/i.test(href)) {
-      return href.replace(/^mailto:/i, '').trim().toLowerCase();
-    }
+    if (href && /^mailto:/i.test(href)) return href.replace(/^mailto:/i, '').trim().toLowerCase();
   }
-
-  // Generic mailto
   const anyMailto = page.locator('a[href^="mailto:"]').first();
   if (await anyMailto.count()) {
     const href = await anyMailto.getAttribute('href');
     if (href) return href.replace(/^mailto:/i, '').trim().toLowerCase();
   }
-
-  // Fallback: search HTML for any email
   const html = await page.content();
   const m = html.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   return m ? m[0].toLowerCase() : '';
 }
 
+// Utility: auto-scroll to load lazy content
+async function autoScroll(page, maxSteps = 20) {
+  let lastHeight = await page.evaluate(() => document.body.scrollHeight);
+  for (let i = 0; i < maxSteps; i++) {
+    await page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
+    await page.waitForTimeout(600);
+    const newHeight = await page.evaluate(() => document.body.scrollHeight);
+    if (newHeight === lastHeight) break;
+    lastHeight = newHeight;
+  }
+}
+
 Actor.main(async () => {
   const input = (await Actor.getInput()) || {};
   const {
-    startUrls = [{ url: 'https://www.coldwellbanker.com/fl/jacksonville/agents' }],
+    startUrls = [{ url: 'https://www.coldwellbanker.com/city/fl/jacksonville/agents' }],
     maxPages = 200,
     maxConcurrency = 5,
     proxy,
@@ -102,8 +100,9 @@ Actor.main(async () => {
   const crawler = new PlaywrightCrawler({
     requestQueue,
     maxConcurrency,
-    requestHandlerTimeoutSecs: 90,
-    navigationTimeoutSecs: 45,
+    headless: true,
+    requestHandlerTimeoutSecs: 120,
+    navigationTimeoutSecs: 60,
     proxyConfiguration: proxy ? await Actor.createProxyConfiguration(proxy) : undefined,
 
     async requestHandler({ request, page, enqueueLinks }) {
@@ -111,44 +110,69 @@ Actor.main(async () => {
 
       if (label === 'LIST') {
         await page.waitForLoadState('domcontentloaded');
+        // Wait a beat for React/MUI to render
+        await page.waitForTimeout(1000);
+        await autoScroll(page, 15);
 
-        // Enqueue agent profile links (various patterns on the site)
-        await enqueueLinks({
-          selector: 'a[href*="/real-estate-agents/"], a[href*="/agent/"], a[href*="/real-estate-agent/"]',
-          strategy: 'same-domain',
-          transformRequestFunction: (req) => {
-            req.userData = { label: 'AGENT' };
-            req.uniqueKey = req.url.split('?')[0];
-            return req;
-          },
+        // Primary: anchors that look like agent profile links
+        // Examples: /fl/jacksonville/agents/<slug>/aid-<id>
+        const agentHrefs = await page.$$eval('a[href*="/agents/"]', (as) => {
+          const urls = as.map(a => a.getAttribute('href') || '').filter(Boolean);
+          // Filter to those that look like agent pages (contain '/aid-')
+          return urls
+            .filter(u => /\/agents\//.test(u) && /\/aid-/.test(u))
+            .map(u => new URL(u, document.baseURI).href);
         });
 
-        // Pagination
-        await enqueueLinks({
-          selector: 'a[rel="next"], a[href*="page="], nav a[aria-label*="Next"]',
-          strategy: 'same-domain',
-          transformRequestFunction: (req) => {
-            req.userData = { label: 'LIST' };
-            return req;
-          },
-        });
+        // If none found, try broader patterns on same-domain links
+        let hrefs = agentHrefs;
+        if (!hrefs.length) {
+          const broad = await page.$$eval('a[href]', (as) => as
+            .map(a => a.getAttribute('href') || '')
+            .filter(Boolean)
+            .map(u => new URL(u, document.baseURI).href));
+          hrefs = Array.from(new Set(broad.filter(u =>
+            /coldwellbanker\.com\/.+\/agents\//.test(u) && /\/aid-/.test(u)
+          )));
+        }
+
+        // Enqueue found agent profile links
+        for (const url of Array.from(new Set(hrefs))) {
+          await requestQueue.addRequest({ url, userData: { label: 'AGENT' }, uniqueKey: url.split('?')[0] });
+        }
+
+        // Try pagination if present
+        const nextLink = await page.locator('a[rel="next"], nav a[aria-label*="Next"], a[href*="page=").page, a[aria-label="Next"]').first();
+        if (await nextLink.count()) {
+          const href = await nextLink.getAttribute('href');
+          if (href) {
+            const nextUrl = new URL(href, page.url()).href;
+            await requestQueue.addRequest({ url: nextUrl, userData: { label: 'LIST' }, uniqueKey: nextUrl.split('?')[0] });
+          }
+        }
+
+        // If we still didn't enqueue anything on the very first list page, emit a screenshot to help debug
+        if ((request.handledAt || 0) < 2 && hrefs.length === 0) {
+          const buf = await page.screenshot({ fullPage: true });
+          await Actor.setValue('list_page_debug.png', buf, { contentType: 'image/png' });
+          log.warning('No agent links found on LIST page. Saved screenshot list_page_debug.png for debugging.');
+        }
       }
 
       if (label === 'AGENT') {
         await page.waitForLoadState('domcontentloaded');
+        await page.waitForTimeout(500);
 
         const name = await extractName(page);
         const phoneRaw = await extractPhone(page);
         const phone = toE164(phoneRaw);
 
-        // If email is already present on the profile via the specified DOM, capture it
         let email = await extractEmail(page);
 
         if (!email) {
-          // Otherwise, push to Contact page where that DOM is typically present
+          // Try contact page
           const contactHref = await page.evaluate(() => {
             const nodes = Array.from(document.querySelectorAll('a, button'));
-            // prefer anchors containing "Contact"
             const link = nodes.find((el) => /contact/i.test(el.textContent || '') && el.tagName === 'A');
             if (link) return link.getAttribute('href') || '';
             const btn = nodes.find((el) => /contact/i.test(el.textContent || '') && el.hasAttribute('data-href'));
@@ -163,13 +187,13 @@ Actor.main(async () => {
               uniqueKey: url.split('?')[0],
             });
           } else {
-            // No contact link; still save row if we have an email from profile
+            // Save profile-only data if email still missing and phone exists — or skip
             if (email) {
-              const { firstName, lastName } = splitName(name);
+              const parts = splitName(name);
               await Actor.pushData({
                 EMAIL: email,
-                FIRSTNAME: firstName,
-                LASTNAME: lastName,
+                FIRSTNAME: parts.firstName,
+                LASTNAME: parts.lastName,
                 SMS: phone,
                 sourceProfile: page.url(),
                 sourceContact: page.url(),
@@ -177,44 +201,37 @@ Actor.main(async () => {
             }
           }
         } else {
-          // Email found on profile directly
-          const { firstName, lastName } = splitName(name);
+          const parts = splitName(name);
           await Actor.pushData({
             EMAIL: email,
-            FIRSTNAME: firstName,
-            LASTNAME: lastName,
+            FIRSTNAME: parts.firstName,
+            LASTNAME: parts.lastName,
             SMS: phone,
             sourceProfile: page.url(),
             sourceContact: page.url(),
           });
         }
-
-        await sleep(250);
       }
 
       if (label === 'CONTACT') {
         await page.waitForLoadState('domcontentloaded');
+        await page.waitForTimeout(400);
 
         const email = await extractEmail(page);
-        // Use the specific phone selector again; contact page may display a better phone
-        const phoneRaw = await extractPhone(page);
-        const phone = toE164(phoneRaw);
-
+        const phone = toE164(await extractPhone(page));
         const { name, profileUrl } = request.userData.partial || {};
-        const { firstName, lastName } = splitName(name || '');
+        const parts = splitName(name || '');
 
         if (email) {
           await Actor.pushData({
             EMAIL: email,
-            FIRSTNAME: firstName,
-            LASTNAME: lastName,
+            FIRSTNAME: parts.firstName,
+            LASTNAME: parts.lastName,
             SMS: phone || '',
             sourceProfile: profileUrl || '',
             sourceContact: page.url(),
           });
         }
-
-        await sleep(200);
       }
     },
 
@@ -229,7 +246,6 @@ Actor.main(async () => {
   const dataset = await Actor.openDataset();
   const { items } = await dataset.getData({ clean: true });
 
-  // Deduplicate by EMAIL
   const deduped = [];
   const seen = new Set();
   for (const it of items) {

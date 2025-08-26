@@ -1,17 +1,17 @@
 # Coldwell Banker Jacksonville Agents → Brevo CSV (Apify Actor)
 
-**Fixes applied:**
-- Removed invalid CSS selector causing pagination error.
-- Robust agent link capture (`/agents/` with `/aid-` or `/agent/` in href).
-- Handles both list URL variants: `/city/fl/jacksonville/agents` and `/fl/jacksonville/agents`.
-- Auto-scroll + multiple "Next" detection strategies.
-- Saves `list_page_debug.png` if no agent links found on first list page.
+**Further hardening to fix 'no records':**
+- Dismisses cookie / consent banners (OneTrust-like).
+- Auto-scroll + optional **Load More** clicks.
+- Waits for `a[href*="/agents/"]` then collects all **/agents/** links (excludes offices).
+- Stronger pagination detection (rel/aria/text/param).
+- Dumps **list_page_debug.png** and **list_page_debug.html** if zero links on first page.
 
-## Run locally
+## Local run
 npm install
 npm start
 
-## Apify input (example)
+## Apify example input
 {
   "startUrls": [
     {"url": "https://www.coldwellbanker.com/city/fl/jacksonville/agents"},

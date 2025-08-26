@@ -70,11 +70,11 @@ async function extractEmail(page) {
 }
 
 // Auto-scroll for lazy-load content
-async function autoScroll(page, maxSteps = 25) {
+async function autoScroll(page, maxSteps = 30) {
   let lastHeight = await page.evaluate(() => document.body.scrollHeight);
   for (let i = 0; i < maxSteps; i++) {
     await page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(800);
     const newHeight = await page.evaluate(() => document.body.scrollHeight);
     if (newHeight === lastHeight) break;
     lastHeight = newHeight;
@@ -83,43 +83,61 @@ async function autoScroll(page, maxSteps = 25) {
 
 // Try to discover the "next" page URL via common patterns
 async function getNextHref(page) {
-  // 1) rel="next"
+  // rel=next
   const rel = await page.locator('a[rel="next"]').first();
   if (await rel.count()) {
     const href = await rel.getAttribute('href');
     if (href) return new URL(href, page.url()).href;
   }
-  // 2) aria-label contains Next
+  // aria-label next
   const ariaNext = await page.evaluate(() => {
     const cand = Array.from(document.querySelectorAll('a[aria-label]'))
       .find(a => /next/i.test(a.getAttribute('aria-label') || ''));
     return cand ? (cand.getAttribute('href') || '') : '';
   });
   if (ariaNext) return new URL(ariaNext, page.url()).href;
-
-  // 3) anchor text contains Next
+  // text next
   const textNext = await page.evaluate(() => {
     const cand = Array.from(document.querySelectorAll('a'))
       .find(a => /\bnext\b/i.test(a.textContent || ''));
     return cand ? (cand.getAttribute('href') || '') : '';
   });
   if (textNext) return new URL(textNext, page.url()).href;
-
-  // 4) any link with page= param higher than current
-  const paramNext = await page.evaluate((current) => {
+  // page= param
+  const paramNext = await page.evaluate(() => {
     const links = Array.from(document.querySelectorAll('a[href*="page="]'));
     const tuples = links.map(a => {
-      const u = new URL(a.getAttribute('href'), document.baseURI);
-      const p = +(u.searchParams.get('page') || '0');
-      return { href: u.href, p };
+      try {
+        const u = new URL(a.getAttribute('href'), document.baseURI);
+        const p = +(u.searchParams.get('page') || '0');
+        return { href: u.href, p };
+      } catch { return { href: '', p: 0 }; }
     }).filter(t => t.p > 0);
     if (!tuples.length) return '';
     tuples.sort((a,b) => a.p - b.p);
     return tuples[0].href;
-  }, page.url());
+  });
   if (paramNext) return paramNext;
-
   return '';
+}
+
+// Attempt to dismiss cookie / consent banners
+async function dismissBanners(page) {
+  try {
+    const sel = [
+      '#onetrust-accept-btn-handler',
+      'button#onetrust-accept-btn-handler',
+      'button:has-text("Accept All")',
+      'button:has-text("Accept")',
+      'button[aria-label="Accept"]',
+      'button[aria-label*="Accept"]'
+    ].join(', ');
+    const btn = page.locator(sel).first();
+    if (await btn.count()) {
+      await btn.click({ timeout: 0 }).catch(()=>{});
+      await page.waitForTimeout(500);
+    }
+  } catch {}
 }
 
 Actor.main(async () => {
@@ -145,27 +163,44 @@ Actor.main(async () => {
     requestQueue,
     maxConcurrency,
     headless: true,
-    requestHandlerTimeoutSecs: 120,
-    navigationTimeoutSecs: 60,
+    requestHandlerTimeoutSecs: 150,
+    navigationTimeoutSecs: 75,
     proxyConfiguration: proxy ? await Actor.createProxyConfiguration(proxy) : undefined,
+    launchContext: {
+      launchOptions: {
+        args: ['--no-sandbox','--disable-dev-shm-usage'],
+      }
+    },
 
     async requestHandler({ request, page, enqueueLinks }) {
       const { label } = request.userData || {};
 
       if (label === 'LIST') {
         await page.waitForLoadState('domcontentloaded');
-        // Allow React/MUI to render
-        await page.waitForTimeout(1200);
-        await autoScroll(page, 20);
+        await dismissBanners(page);
+        await page.waitForTimeout(1500);
+        await autoScroll(page, 25);
 
-        // Collect agent profile links
+        // Try "Load more" buttons if present
+        const loadMore = page.locator('button:has-text("Load More"), button[aria-label*="Load more"]').first();
+        let clicks = 0;
+        while (await loadMore.count() && clicks < 5) {
+          await loadMore.click().catch(()=>{});
+          clicks += 1;
+          await page.waitForTimeout(1200);
+          await autoScroll(page, 10);
+        }
+
+        // Wait for any anchor with /agents/ to appear
+        await page.waitForSelector('a[href*="/agents/"]', { timeout: 8000 }).catch(()=>{});
+
+        // Collect agent profile links broadly; exclude offices
         let hrefs = await page.$$eval('a[href*="/agents/"]', (as) => {
           const urls = as.map(a => a.getAttribute('href') || '').filter(Boolean);
-          return urls.map(u => new URL(u, document.baseURI).href);
+          return urls
+            .filter(u => !/\/offices\//.test(u))
+            .map(u => new URL(u, document.baseURI).href);
         });
-
-        // Narrow to agent-like patterns
-        hrefs = hrefs.filter(u => /\/agents\//.test(u) && (/\/aid-/.test(u) || /\/agent\//.test(u) || /\/agents\//.test(u)));
 
         // Unique
         hrefs = Array.from(new Set(hrefs));
@@ -174,27 +209,29 @@ Actor.main(async () => {
         for (const url of hrefs) {
           await requestQueue.addRequest({ url, userData: { label: 'AGENT' }, uniqueKey: url.split('?')[0] });
         }
+        log.info(`LIST found ${hrefs.length} agent links on ${page.url()}`);
 
-        // Pagination (fix invalid selector bug by computing URL in JS):
+        // Pagination detection
         const nextHref = await getNextHref(page);
-
-        // Guard against infinite pagination
         const nextPageNo = (request.userData.pageNo || 1) + 1;
         if (nextHref && nextPageNo <= maxPages) {
           await requestQueue.addRequest({ url: nextHref, userData: { label: 'LIST', pageNo: nextPageNo }, uniqueKey: nextHref.split('?')[0] });
         }
 
-        // If nothing was enqueued and this is the first list page, save screenshot
+        // Debug dump if nothing found on first page
         if ((request.userData.pageNo || 1) === 1 && hrefs.length === 0) {
           const buf = await page.screenshot({ fullPage: true });
           await Actor.setValue('list_page_debug.png', buf, { contentType: 'image/png' });
-          log.warning('No agent links found on LIST page. Saved screenshot list_page_debug.png for debugging.');
+          const html = await page.content();
+          await Actor.setValue('list_page_debug.html', html, { contentType: 'text/html; charset=utf-8' });
+          log.warning('No agent links found on LIST page. Saved list_page_debug.png and list_page_debug.html');
         }
       }
 
       if (label === 'AGENT') {
         await page.waitForLoadState('domcontentloaded');
-        await page.waitForTimeout(600);
+        await dismissBanners(page);
+        await page.waitForTimeout(800);
 
         const name = await extractName(page);
         const phoneRaw = await extractPhone(page);
@@ -244,7 +281,8 @@ Actor.main(async () => {
 
       if (label === 'CONTACT') {
         await page.waitForLoadState('domcontentloaded');
-        await page.waitForTimeout(400);
+        await dismissBanners(page);
+        await page.waitForTimeout(500);
 
         const email = await extractEmail(page);
         const phone = toE164(await extractPhone(page));

@@ -33,13 +33,26 @@ function toE164(usLike) {
   return digits;
 }
 
+async function extractName(page) {
+  // Preferred selector from user: h1[data-testid="office-name"]
+  const el = page.locator('h1[data-testid="office-name"]').first();
+  if (await el.count()) return cleanText(await el.textContent());
+  // Fallback: heading
+  return cleanText(await page.locator('h1, h2').first().textContent());
+}
+
 async function extractPhone(page) {
-  // Prefer tel: links
+  // Preferred selector from user
+  const p = page.locator('p.MuiTypography-body1.css-1p1owym').first();
+  if (await p.count()) return cleanText(await p.textContent());
+
+  // tel: link
   const telLink = page.locator('a[href^="tel:"]').first();
   if (await telLink.count()) {
     const href = await telLink.getAttribute('href');
     if (href) return cleanText(href.replace(/^tel:/i, ''));
   }
+
   // Fallback: regex scan over visible text
   const texts = await page.$$eval('*', (els) => els.map((el) => el.textContent || ''));
   const joined = texts.join(' ');
@@ -48,40 +61,26 @@ async function extractPhone(page) {
 }
 
 async function extractEmail(page) {
-  // 1) direct mailto
-  const emails = await page.$$eval('a[href^="mailto:"]', (els) =>
-    els
-      .map((a) => a.getAttribute('href') || '')
-      .map((h) => h.replace(/^mailto:/i, ''))
-      .filter(Boolean)
-  );
-  if (emails.length) return emails[0].toLowerCase();
+  // Preferred selector from user: div[emailDiv] a[emailLink] -> mailto
+  const emailA = page.locator('div[data-testid="emailDiv"] a[data-testid="emailLink"]').first();
+  if (await emailA.count()) {
+    const href = await emailA.getAttribute('href');
+    if (href && /^mailto:/i.test(href)) {
+      return href.replace(/^mailto:/i, '').trim().toLowerCase();
+    }
+  }
 
-  // 2) search the HTML for any email pattern
+  // Generic mailto
+  const anyMailto = page.locator('a[href^="mailto:"]').first();
+  if (await anyMailto.count()) {
+    const href = await anyMailto.getAttribute('href');
+    if (href) return href.replace(/^mailto:/i, '').trim().toLowerCase();
+  }
+
+  // Fallback: search HTML for any email
   const html = await page.content();
   const m = html.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  if (m) return m[0].toLowerCase();
-
-  return '';
-}
-
-// Simple CSV escaper and builder (no external deps)
-function csvEscape(value) {
-  const s = (value ?? '').toString();
-  if (/[",\n]/.test(s)) {
-    return '"' + s.replace(/"/g, '""') + '"';
-  }
-  return s;
-}
-
-function toCsv(rows, headers) {
-  const lines = [];
-  lines.push(headers.join(','));
-  for (const row of rows) {
-    const line = headers.map((h) => csvEscape(row[h] ?? '')).join(',');
-    lines.push(line);
-  }
-  return lines.join('\n');
+  return m ? m[0].toLowerCase() : '';
 }
 
 Actor.main(async () => {
@@ -113,10 +112,9 @@ Actor.main(async () => {
       if (label === 'LIST') {
         await page.waitForLoadState('domcontentloaded');
 
-        // Enqueue agent profile links (various patterns)
+        // Enqueue agent profile links (various patterns on the site)
         await enqueueLinks({
-          selector:
-            'a[href*="/real-estate-agents/"], a[href*="/agent/"], a[href*="/real-estate-agent/"]',
+          selector: 'a[href*="/real-estate-agents/"], a[href*="/agent/"], a[href*="/real-estate-agent/"]',
           strategy: 'same-domain',
           transformRequestFunction: (req) => {
             req.userData = { label: 'AGENT' };
@@ -125,7 +123,7 @@ Actor.main(async () => {
           },
         });
 
-        // Enqueue pagination (next / numbered pages)
+        // Pagination
         await enqueueLinks({
           selector: 'a[rel="next"], a[href*="page="], nav a[aria-label*="Next"]',
           strategy: 'same-domain',
@@ -139,47 +137,56 @@ Actor.main(async () => {
       if (label === 'AGENT') {
         await page.waitForLoadState('domcontentloaded');
 
-        // Name from heading
-        const name = cleanText(await page.locator('h1, h2').first().textContent());
-
-        // Phone from profile
+        const name = await extractName(page);
         const phoneRaw = await extractPhone(page);
         const phone = toE164(phoneRaw);
 
-        // Find "Contact" link or button
-        const contactHref = await page.evaluate(() => {
-          const nodes = Array.from(document.querySelectorAll('a, button'));
-          const link = nodes.find(
-            (el) => /contact/i.test(el.textContent || '') && el.tagName === 'A'
-          );
-          if (link) return link.getAttribute('href') || '';
-          const btn = nodes.find(
-            (el) => /contact/i.test(el.textContent || '') && el.hasAttribute('data-href')
-          );
-          return btn ? btn.getAttribute('data-href') : '';
-        });
+        // If email is already present on the profile via the specified DOM, capture it
+        let email = await extractEmail(page);
 
-        if (contactHref) {
-          const url = new URL(contactHref, page.url()).href;
-          await requestQueue.addRequest({
-            url,
-            userData: { label: 'CONTACT', partial: { name, phone, profileUrl: page.url() } },
-            uniqueKey: url.split('?')[0],
+        if (!email) {
+          // Otherwise, push to Contact page where that DOM is typically present
+          const contactHref = await page.evaluate(() => {
+            const nodes = Array.from(document.querySelectorAll('a, button'));
+            // prefer anchors containing "Contact"
+            const link = nodes.find((el) => /contact/i.test(el.textContent || '') && el.tagName === 'A');
+            if (link) return link.getAttribute('href') || '';
+            const btn = nodes.find((el) => /contact/i.test(el.textContent || '') && el.hasAttribute('data-href'));
+            return btn ? btn.getAttribute('data-href') : '';
           });
-        } else {
-          // Try to extract email on profile if contact not found
-          const email = await extractEmail(page);
-          const { firstName, lastName } = splitName(name);
-          if (email) {
-            await Actor.pushData({
-              EMAIL: email,
-              FIRSTNAME: firstName,
-              LASTNAME: lastName,
-              SMS: phone,
-              sourceProfile: page.url(),
-              sourceContact: page.url(),
+
+          if (contactHref) {
+            const url = new URL(contactHref, page.url()).href;
+            await requestQueue.addRequest({
+              url,
+              userData: { label: 'CONTACT', partial: { name, phone, profileUrl: page.url() } },
+              uniqueKey: url.split('?')[0],
             });
+          } else {
+            // No contact link; still save row if we have an email from profile
+            if (email) {
+              const { firstName, lastName } = splitName(name);
+              await Actor.pushData({
+                EMAIL: email,
+                FIRSTNAME: firstName,
+                LASTNAME: lastName,
+                SMS: phone,
+                sourceProfile: page.url(),
+                sourceContact: page.url(),
+              });
+            }
           }
+        } else {
+          // Email found on profile directly
+          const { firstName, lastName } = splitName(name);
+          await Actor.pushData({
+            EMAIL: email,
+            FIRSTNAME: firstName,
+            LASTNAME: lastName,
+            SMS: phone,
+            sourceProfile: page.url(),
+            sourceContact: page.url(),
+          });
         }
 
         await sleep(250);
@@ -187,8 +194,13 @@ Actor.main(async () => {
 
       if (label === 'CONTACT') {
         await page.waitForLoadState('domcontentloaded');
+
         const email = await extractEmail(page);
-        const { name, phone, profileUrl } = request.userData.partial || {};
+        // Use the specific phone selector again; contact page may display a better phone
+        const phoneRaw = await extractPhone(page);
+        const phone = toE164(phoneRaw);
+
+        const { name, profileUrl } = request.userData.partial || {};
         const { firstName, lastName } = splitName(name || '');
 
         if (email) {
@@ -200,21 +212,6 @@ Actor.main(async () => {
             sourceProfile: profileUrl || '',
             sourceContact: page.url(),
           });
-        } else {
-          // Fallbacks
-          const phoneRaw = phone || (await extractPhone(page));
-          const phoneFmt = toE164(phoneRaw);
-          const fallbackEmail = await extractEmail(page);
-          if (fallbackEmail) {
-            await Actor.pushData({
-              EMAIL: fallbackEmail,
-              FIRSTNAME: firstName,
-              LASTNAME: lastName,
-              SMS: phoneFmt,
-              sourceProfile: profileUrl || '',
-              sourceContact: page.url(),
-            });
-          }
         }
 
         await sleep(200);
@@ -228,7 +225,7 @@ Actor.main(async () => {
 
   await crawler.run();
 
-  // Prepare Brevo CSV
+  // Prepare Brevo CSV (manual writer)
   const dataset = await Actor.openDataset();
   const { items } = await dataset.getData({ clean: true });
 
@@ -248,7 +245,15 @@ Actor.main(async () => {
   }
 
   const headers = ['EMAIL', 'FIRSTNAME', 'LASTNAME', 'SMS'];
-  const csv = toCsv(deduped, headers);
+  const csvLines = [headers.join(',')];
+  for (const row of deduped) {
+    const vals = headers.map((h) => {
+      const s = (row[h] ?? '').toString();
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    });
+    csvLines.push(vals.join(','));
+  }
+  const csv = csvLines.join('\n');
 
   await Actor.setValue('brevo.csv', csv, { contentType: 'text/csv; charset=utf-8' });
   log.info(`Done. Records: ${deduped.length}. CSV saved as brevo.csv in Key-Value store.`);

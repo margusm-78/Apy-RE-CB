@@ -7,7 +7,7 @@
       "title": "Start URLs",
       "type": "array",
       "editor": "requestListSources",
-      "description": "Pages that list agents. Defaults to Jacksonville agents index.",
+      "description": "Agent list pages to start from. Defaults to the Jacksonville agents index.",
       "prefill": [
         {
           "url": "https://www.coldwellbanker.com/fl/jacksonville/agents"
@@ -18,19 +18,21 @@
       "title": "Max list pages to crawl",
       "type": "integer",
       "minimum": 1,
-      "default": 200
+      "default": 200,
+      "description": "Upper limit for paginated list pages to enqueue (prevents infinite loops)."
     },
     "maxConcurrency": {
       "title": "Max concurrency",
       "type": "integer",
       "minimum": 1,
-      "default": 5
+      "default": 5,
+      "description": "How many pages to crawl in parallel. Increase carefully to avoid throttling/blocks."
     },
     "proxy": {
       "title": "Proxy configuration",
       "type": "object",
       "editor": "proxy",
-      "description": "Use Apify proxy for reliability."
+      "description": "Use Apify Proxy or your own proxy for reliability and to reduce blocking."
     }
   },
   "required": [
